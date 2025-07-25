@@ -14,21 +14,17 @@ import java.util.concurrent.atomic.AtomicLong;
 public class CustomFileReader {
 
     private static final int BLOCK_SIZE = 64 * 1024; // 64 KB
-    static String INPUT_FOLDER = "src/DataSet/input_folder";
-    static String OUTPUT_FOLDER = "src/DataSet/output_folder";
+    public static String INPUT_FOLDER = "src/DataSet/input_folder";
+    public static String OUTPUT_FOLDER = "src/DataSet/output_folder";
 
-    private ExecutorService ioPool;          // For I/O CompletionHandlers
-    private ExecutorService processingPool;  // For CPU-bound data manipulation
-    private AtomicInteger filesToProcess;    // Counter for remaining files
-    private BlockingQueue<Boolean> overallCompletionSignal; // To signal when ALL files are done
+    private ExecutorService ioPool;          
+    private ExecutorService processingPool;  
+    private AtomicInteger filesToProcess;    
+    private BlockingQueue<Boolean> overallCompletionSignal; 
 
     public CustomFileReader() {
-        // A dedicated pool for I/O completion handlers (optional, can use default)
-        // Using a small fixed pool for I/O can prevent I/O threads from being saturated by processing logic
         this.ioPool = Executors.newFixedThreadPool(Math.min(4, Runtime.getRuntime().availableProcessors()));
-        // A larger pool for CPU-bound processing
         this.processingPool = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors() * 2);
-
         this.filesToProcess = new AtomicInteger(0);
         this.overallCompletionSignal = new ArrayBlockingQueue<>(1);
     }
@@ -37,10 +33,12 @@ public class CustomFileReader {
         Path inputPath = Paths.get(INPUT_FOLDER);
         Path outputPath = Paths.get(OUTPUT_FOLDER);
 
-        // Ensure output directory exists and is clean
+        System.out.println("[CustomFileReader] Starting processFolder for INPUT_FOLDER: " + inputPath.toAbsolutePath());
+     
         if (Files.exists(outputPath)) {
+            System.out.println("[CustomFileReader] Output path exists. Cleaning: " + outputPath.toAbsolutePath());
             Files.walk(outputPath)
-                 .sorted((p1, p2) -> -p1.toString().compareTo(p2.toString())) // Delete from deepest first
+                 .sorted((p1, p2) -> -p1.toString().compareTo(p2.toString())) 
                  .forEach(p -> {
                      try {
                          Files.delete(p);
@@ -50,43 +48,54 @@ public class CustomFileReader {
                  });
         }
         Files.createDirectories(outputPath);
+        System.out.println("[CustomFileReader] Output directory ensured: " + outputPath.toAbsolutePath());
 
-        System.out.println("Starting to process folder: " + INPUT_FOLDER);
+        System.out.println("[CustomFileReader] Starting to walk file tree for: " + INPUT_FOLDER);
 
-        // Discover files and start processing them
         Files.walkFileTree(inputPath, new SimpleFileVisitor<Path>() {
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                System.out.println("[walkFileTree] Visited file: " + file.getFileName());
+                System.out.println("[walkFileTree] Is it a regular file? " + attrs.isRegularFile());
                 if (attrs.isRegularFile()) {
-                    filesToProcess.incrementAndGet(); // Increment counter for each file found
-                    processSingleFile(file); // Start asynchronous processing for this file
+                    filesToProcess.incrementAndGet(); 
+                    System.out.println("[walkFileTree] filesToProcess incremented to: " + filesToProcess.get());
+                    processSingleFile(file); 
                 }
                 return FileVisitResult.CONTINUE;
             }
 
             @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                System.out.println("[walkFileTree] Entering directory: " + dir.getFileName());
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
             public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                System.out.println("[walkFileTree] Exiting directory: " + dir.getFileName());
                 if (dir.equals(inputPath)) {
-                    // All files have been discovered and processing initiated.
-                    // Now, wait for all completion signals.
-                    // No need to signal completion here directly, as it's handled by checkAllFilesCompletion.
-                    System.out.println("All files in folder discovered. Waiting for processing to complete...");
+                    System.out.println("[CustomFileReader] All files in folder discovered. Waiting for processing to complete...");
                 }
                 return FileVisitResult.CONTINUE;
             }
 
             @Override
             public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException {
-                System.err.println("Failed to visit file " + file + ": " + exc.getMessage());
+                System.err.println("[walkFileTree] Failed to visit file " + file + ": " + exc.getMessage());
                 return FileVisitResult.CONTINUE;
             }
         });
 
-        // Wait for all files to be processed
+        System.out.println("[CustomFileReader] walkFileTree finished. Initial filesToProcess count: " + filesToProcess.get());
+        if (filesToProcess.get() == 0) {
+            System.out.println("[CustomFileReader] No regular files found in " + INPUT_FOLDER + ". Signalling immediate completion.");
+            overallCompletionSignal.put(true);
+        }
+
         overallCompletionSignal.take();
         System.out.println("Finished processing all files in folder.");
 
-        // Shut down pools
         ioPool.shutdown();
         processingPool.shutdown();
         try {
@@ -105,7 +114,8 @@ public class CustomFileReader {
         Path relativePath = Paths.get(INPUT_FOLDER).relativize(inputFile);
         Path outputFile = Paths.get(OUTPUT_FOLDER).resolve(relativePath);
 
-        // Ensure output directory structure is mirrored
+        System.out.println("[processSingleFile] Processing: " + inputFile.getFileName() + " to " + outputFile.toAbsolutePath());
+
         Files.createDirectories(outputFile.getParent());
 
         AsynchronousFileChannel inputChannel = null;
@@ -119,16 +129,24 @@ public class CustomFileReader {
             long inputFileSize = inputChannel.size();
             System.out.println("Processing file: " + inputFile.getFileName() + ", size: " + inputFileSize + " bytes");
 
-            // Create a specific state object for this file's processing
+            if (inputFileSize == 0) {
+                System.out.println("[processSingleFile] Warning: File " + inputFile.getFileName() + " is 0 bytes. It will be marked as complete immediately.");
+                FileProcessingState emptyFileState = new FileProcessingState(
+                        inputChannel, outputChannel, inputFileSize, inputFile.getFileName().toString());
+                emptyFileState.allReadsInitiated = true;
+                checkFileCompletion(emptyFileState);
+                return;
+            }
+
             FileProcessingState fileState = new FileProcessingState(
                     inputChannel, outputChannel, inputFileSize, inputFile.getFileName().toString());
 
-            // Start the first read for this file
             readNextBlock(fileState);
 
         } catch (IOException e) {
             System.err.println("Error opening channels for file " + inputFile + ": " + e.getMessage());
-            
+            FileProcessingState dummyState = new FileProcessingState(inputChannel, outputChannel, 0, inputFile.getFileName().toString());
+            fileFailed(null, dummyState, e);
         }
     }
 
@@ -136,10 +154,14 @@ public class CustomFileReader {
         final long currentBlockStartPosition = fileState.currentReadPosition.getAndAdd(BLOCK_SIZE);
 
         if (currentBlockStartPosition >= fileState.inputFileSize) {
-            // All read operations for this file have been initiated
-            // The file completion will be signaled when all writes for this file are done
+            // All read operations for this file have been initiated (or no more are needed).
+            // This is the point where we know we've covered the entire file for reads.
+            System.out.println("[readNextBlock] All reads INITIATED for file: " + fileState.fileName + ". Current pos: " + currentBlockStartPosition + ", File size: " + fileState.inputFileSize); // Debug
+            fileState.allReadsInitiated = true; // <-- Moved this line here!
+            checkFileCompletion(fileState); // Check if this file is fully done (all writes might be done too)
             return;
         }
+        System.out.println("[readNextBlock] Initiating read for " + fileState.fileName + " at position " + currentBlockStartPosition);
 
         ByteBuffer buffer = ByteBuffer.allocate(BLOCK_SIZE);
         ReadAttachment attachment = new ReadAttachment(buffer, currentBlockStartPosition, fileState);
@@ -147,10 +169,11 @@ public class CustomFileReader {
         fileState.inputChannel.read(buffer, currentBlockStartPosition, attachment, new CompletionHandler<Integer, ReadAttachment>() {
             @Override
             public void completed(Integer bytesRead, ReadAttachment attach) {
-                if (bytesRead < 0) { // End of stream for this file
-                    // No more reads to initiate for this file.
-                    fileState.allReadsInitiated = true; // Mark that all reads for this file are launched
-                    checkFileCompletion(fileState); // Check if this file is fully done
+                System.out.println("[read.completed] Read " + bytesRead + " bytes for " + attach.getFileState().fileName + " at " + attach.getStartPosition());
+                if (bytesRead < 0) { // Actual End of File detected by the read operation
+                    System.out.println("[read.completed] EOF detected for " + attach.getFileState().fileName);
+                    // No need to set allReadsInitiated here again, it should already be true.
+                    checkFileCompletion(fileState); // Re-check completion
                     return;
                 }
 
@@ -169,7 +192,6 @@ public class CustomFileReader {
                     }
                 });
 
-                // Initiate the next read operation for THIS file
                 readNextBlock(fileState);
             }
 
@@ -182,13 +204,11 @@ public class CustomFileReader {
     }
 
     private ByteBuffer processBuffer(ByteBuffer inputBuffer, long startPosition, String fileName) {
-        // --- YOUR MANIPULATION LOGIC GOES HERE ---
-        // Example: Convert content to uppercase
         String originalContent = Charset.defaultCharset().decode(inputBuffer).toString();
-        String modifiedContent = originalContent.toUpperCase(); // Simple manipulation
+        String modifiedContent = originalContent.toUpperCase(); 
         ByteBuffer outputBuffer = Charset.defaultCharset().encode(modifiedContent);
 
-        // System.out.println("Processed chunk for " + fileName + " from position " + startPosition);
+        System.out.println("[processBuffer] Processed chunk for " + fileName + " from position " + startPosition + ". Original size: " + inputBuffer.limit() + ", Processed size: " + outputBuffer.limit());
         inputBuffer.clear();
         return outputBuffer;
     }
@@ -206,12 +226,14 @@ public class CustomFileReader {
             fileState.processedBuffers.remove(writePos);
             fileState.nextWritePosition.addAndGet(writtenBytesInThisBlock);
 
+            System.out.println("[attemptWrite] Initiating write for " + fileState.fileName + " at position " + writePos + " (size: " + writtenBytesInThisBlock + ")");
+
             fileState.outputChannel.write(bufferToWrite, writePos, bufferToWrite, new CompletionHandler<Integer, ByteBuffer>() {
                 @Override
                 public void completed(Integer result, ByteBuffer attachment) {
-                    // System.out.println("Written " + result + " bytes for " + fileState.fileName + " at position " + writePos);
-                    fileState.totalBytesWritten.addAndGet(result); // Track total bytes written for this file
-                    checkFileCompletion(fileState); // Check if this file is done writing
+                    System.out.println("[write.completed] Written " + result + " bytes for " + fileState.fileName + " at position " + writePos);
+                    fileState.totalBytesWritten.addAndGet(result); 
+                    checkFileCompletion(fileState); 
                 }
 
                 @Override
@@ -223,47 +245,63 @@ public class CustomFileReader {
         }
     }
 
-    // Checks if a single file has completed its processing and writing
+   
     private void checkFileCompletion(FileProcessingState fileState) {
-        // This logic can be tricky if output file size differs from input file size.
-        // Assuming output size == input size for now.
-        // If output size can differ, you need to track total expected output bytes or just rely on outstanding writes.
-        if (fileState.allReadsInitiated && fileState.processedBuffers.isEmpty() && fileState.nextWritePosition.get() >= fileState.inputFileSize) {
-             // If the file was empty, inputFileSize is 0, nextWritePosition is 0. This condition handles it.
+        boolean allReadsDone = fileState.allReadsInitiated;
+        boolean processedBuffersEmpty = fileState.processedBuffers.isEmpty();
+        long currentNextWritePosition = fileState.nextWritePosition.get();
+        long fileTotalSize = fileState.inputFileSize;
+
+        System.out.println("[checkFileCompletion] Checking " + fileState.fileName + ": " +
+                           "allReadsDone=" + allReadsDone +
+                           ", processedBuffersEmpty=" + processedBuffersEmpty +
+                           ", nextWritePos=" + currentNextWritePosition +
+                           ", fileTotalSize=" + fileTotalSize +
+                           ", isNextWritePosFinal=" + (currentNextWritePosition >= fileTotalSize));
+
+        if (allReadsDone && processedBuffersEmpty && currentNextWritePosition >= fileTotalSize) {
+            System.out.println("[checkFileCompletion] ALL CONDITIONS MET for " + fileState.fileName);
             try {
                 if (fileState.inputChannel.isOpen()) fileState.inputChannel.close();
                 if (fileState.outputChannel.isOpen()) fileState.outputChannel.close();
                 System.out.println("Finished processing and writing file: " + fileState.fileName);
-                filesToProcess.decrementAndGet(); // Decrement the global counter
-                checkAllFilesCompletion(); // Check if all files are done
+                filesToProcess.decrementAndGet(); 
+                System.out.println("[checkFileCompletion] filesToProcess decremented to: " + filesToProcess.get()); 
+                checkAllFilesCompletion(); 
             } catch (IOException e) {
                 System.err.println("Error closing channels for " + fileState.fileName + ": " + e.getMessage());
-                // This is an unusual error, but treat it as a failure for this file
                 filesToProcess.decrementAndGet();
                 checkAllFilesCompletion();
             }
+        } else {
+            System.out.println("[checkFileCompletion] Conditions NOT YET MET for " + fileState.fileName);
         }
     }
 
-    // Handles a failure for a specific file
+
     private void fileFailed(ByteBuffer buffer, FileProcessingState fileState, Throwable cause) {
         System.err.println("File processing failed for " + fileState.fileName + ": " + cause.getMessage());
         try {
             if (fileState.inputChannel != null && fileState.inputChannel.isOpen()) fileState.inputChannel.close();
             if (fileState.outputChannel != null && fileState.outputChannel.isOpen()) fileState.outputChannel.close();
-            // Delete partially written output file if desired
-            Files.deleteIfExists(Paths.get(OUTPUT_FOLDER).resolve(Paths.get(INPUT_FOLDER).relativize(Paths.get(fileState.fileName))));
+           
+            Path inputFileParent = Paths.get(INPUT_FOLDER);
+            Path outputFileToDelete = Paths.get(OUTPUT_FOLDER).resolve(inputFileParent.relativize(Paths.get(fileState.fileName)));
+            Files.deleteIfExists(outputFileToDelete);
+            System.err.println("Attempted to delete partial output: " + outputFileToDelete);
         } catch (IOException e) {
             System.err.println("Error cleaning up after file failure for " + fileState.fileName + ": " + e.getMessage());
         } finally {
-            filesToProcess.decrementAndGet(); // Decrement regardless of success/failure
+            filesToProcess.decrementAndGet(); 
+            System.out.println("[fileFailed] filesToProcess decremented to: " + filesToProcess.get());
             checkAllFilesCompletion();
         }
     }
 
-    // Checks if all files in the folder have completed processing
+
     private void checkAllFilesCompletion() {
         if (filesToProcess.get() == 0) {
+            System.out.println("[checkAllFilesCompletion] All files processed. Signalling overall completion.");
             try {
                 overallCompletionSignal.put(true);
             } catch (InterruptedException e) {
@@ -272,20 +310,18 @@ public class CustomFileReader {
         }
     }
 
-    // --- Helper classes for state management ---
 
-    // State for a single file's processing
     private static class FileProcessingState {
         final AsynchronousFileChannel inputChannel;
         final AsynchronousFileChannel outputChannel;
         final long inputFileSize;
-        final String fileName; // For logging
+        final String fileName; 
 
         final AtomicLong currentReadPosition = new AtomicLong(0);
         final ConcurrentSkipListMap<Long, ByteBuffer> processedBuffers = new ConcurrentSkipListMap<>();
         final AtomicLong nextWritePosition = new AtomicLong(0);
-        final AtomicLong totalBytesWritten = new AtomicLong(0); // Useful if output size changes
-        volatile boolean allReadsInitiated = false; // Flag to know when all reads for THIS file are launched
+        final AtomicLong totalBytesWritten = new AtomicLong(0); 
+        volatile boolean allReadsInitiated = false; 
 
         FileProcessingState(AsynchronousFileChannel inputChannel, AsynchronousFileChannel outputChannel, long inputFileSize, String fileName) {
             this.inputChannel = inputChannel;
@@ -311,10 +347,7 @@ public class CustomFileReader {
         public FileProcessingState getFileState() { return fileState; }
     }
 
-    
-
-    // Helper method to create a dummy folder with multiple files
-    private static void createDummyFolderWithFiles(String folderPath, int numberOfFiles, long fileSizePerFile) {
+    public static void createDummyFolderWithFiles(String folderPath, int numberOfFiles, long fileSizePerFile) {
         Path folder = Paths.get(folderPath);
         try {
             if (Files.exists(folder)) {
